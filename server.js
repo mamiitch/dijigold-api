@@ -32,6 +32,7 @@ async function setupDB() {
       CREATE TABLE IF NOT EXISTS dg_products (
         id SERIAL PRIMARY KEY,
         firm_id TEXT NOT NULL,
+        source_id TEXT,
         barcode TEXT DEFAULT '',
         name TEXT NOT NULL,
         category TEXT DEFAULT '',
@@ -45,6 +46,7 @@ async function setupDB() {
       CREATE TABLE IF NOT EXISTS dg_customers (
         id SERIAL PRIMARY KEY,
         firm_id TEXT NOT NULL,
+        source_id TEXT,
         name TEXT NOT NULL,
         phone TEXT DEFAULT '',
         address TEXT DEFAULT '',
@@ -103,6 +105,14 @@ async function setupDB() {
         note TEXT DEFAULT '',
         created_at TIMESTAMP DEFAULT NOW()
       );
+    `);
+
+    // Backfill / migrate for existing deployments
+    await client.query(`
+      ALTER TABLE dg_products ADD COLUMN IF NOT EXISTS source_id TEXT;
+      ALTER TABLE dg_customers ADD COLUMN IF NOT EXISTS source_id TEXT;
+      CREATE UNIQUE INDEX IF NOT EXISTS dg_products_firm_source_uidx ON dg_products (firm_id, source_id);
+      CREATE UNIQUE INDEX IF NOT EXISTS dg_customers_firm_source_uidx ON dg_customers (firm_id, source_id);
     `);
     console.log('Veritabanı tabloları hazır');
   } finally {
@@ -350,6 +360,89 @@ app.post('/settings', authMiddleware, async (req, res) => {
     }
     res.json({ ok: true });
   } catch(e) { res.json({ ok: false, error: e.message }); }
+});
+
+// ===== SYNC (Phase 1: desktop -> cloud push) =====
+// Desktop sends its local integer IDs as `sourceId` (string/number).
+// We upsert by (firm_id, source_id) so re-sending is safe.
+app.post('/sync/push', authMiddleware, async (req, res) => {
+  const fid = req.user.firmId;
+  const { products = [], customers = [] } = req.body || {};
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    for (const p of products) {
+      const sourceId = p.sourceId ?? p.source_id ?? p.id ?? null;
+      if (!sourceId) continue;
+      await client.query(
+        `
+        INSERT INTO dg_products (firm_id, source_id, barcode, name, category, karat, gram, stock, min_stock, price, updated_at)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW())
+        ON CONFLICT (firm_id, source_id)
+        DO UPDATE SET
+          barcode=EXCLUDED.barcode,
+          name=EXCLUDED.name,
+          category=EXCLUDED.category,
+          karat=EXCLUDED.karat,
+          gram=EXCLUDED.gram,
+          stock=EXCLUDED.stock,
+          min_stock=EXCLUDED.min_stock,
+          price=EXCLUDED.price,
+          updated_at=NOW()
+        `,
+        [
+          fid,
+          String(sourceId),
+          p.barcode || '',
+          p.name,
+          p.category || '',
+          p.karat || '14',
+          p.gram || 0,
+          p.stock || 0,
+          p.min_stock ?? p.minStock ?? 1,
+          p.price || 0
+        ]
+      );
+    }
+
+    for (const c of customers) {
+      const sourceId = c.sourceId ?? c.source_id ?? c.id ?? null;
+      if (!sourceId) continue;
+      await client.query(
+        `
+        INSERT INTO dg_customers (firm_id, source_id, name, phone, address, notes, balance, updated_at)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())
+        ON CONFLICT (firm_id, source_id)
+        DO UPDATE SET
+          name=EXCLUDED.name,
+          phone=EXCLUDED.phone,
+          address=EXCLUDED.address,
+          notes=EXCLUDED.notes,
+          balance=EXCLUDED.balance,
+          updated_at=NOW()
+        `,
+        [
+          fid,
+          String(sourceId),
+          c.name,
+          c.phone || '',
+          c.address || '',
+          c.notes || '',
+          c.balance || 0
+        ]
+      );
+    }
+
+    await client.query('COMMIT');
+    res.json({ ok: true, pushed: { products: products.length, customers: customers.length } });
+  } catch (e) {
+    try { await client.query('ROLLBACK'); } catch {}
+    res.json({ ok: false, error: e.message });
+  } finally {
+    client.release();
+  }
 });
 
 // Health check
