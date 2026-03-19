@@ -32,7 +32,6 @@ async function setupDB() {
       CREATE TABLE IF NOT EXISTS dg_products (
         id SERIAL PRIMARY KEY,
         firm_id TEXT NOT NULL,
-        source_id TEXT,
         barcode TEXT DEFAULT '',
         name TEXT NOT NULL,
         category TEXT DEFAULT '',
@@ -46,7 +45,6 @@ async function setupDB() {
       CREATE TABLE IF NOT EXISTS dg_customers (
         id SERIAL PRIMARY KEY,
         firm_id TEXT NOT NULL,
-        source_id TEXT,
         name TEXT NOT NULL,
         phone TEXT DEFAULT '',
         address TEXT DEFAULT '',
@@ -89,6 +87,35 @@ async function setupDB() {
         note TEXT DEFAULT '',
         created_at TIMESTAMP DEFAULT NOW()
       );
+      CREATE TABLE IF NOT EXISTS dg_hurdalar (
+        id SERIAL PRIMARY KEY, firm_id TEXT NOT NULL, alim_no TEXT,
+        customer_name TEXT DEFAULT '', karat TEXT DEFAULT '14',
+        gram REAL DEFAULT 0, has_gram REAL DEFAULT 0, kur_fiyat REAL DEFAULT 0,
+        toplam REAL DEFAULT 0, note TEXT DEFAULT '', created_at TIMESTAMP DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS dg_doviz (
+        id SERIAL PRIMARY KEY, firm_id TEXT NOT NULL, doviz_cinsi TEXT DEFAULT 'USD',
+        islem_tipi TEXT DEFAULT 'alis', miktar REAL DEFAULT 0, kur REAL DEFAULT 0,
+        tl_tutar REAL DEFAULT 0, note TEXT DEFAULT '', created_at TIMESTAMP DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS dg_giderler (
+        id SERIAL PRIMARY KEY, firm_id TEXT NOT NULL, gider_no TEXT,
+        kategori TEXT DEFAULT 'diger', aciklama TEXT NOT NULL, tutar REAL DEFAULT 0,
+        odeme_tipi TEXT DEFAULT 'nakit', created_at TIMESTAMP DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS dg_banka_hesaplari (
+        id SERIAL PRIMARY KEY, firm_id TEXT NOT NULL, name TEXT NOT NULL,
+        balance REAL DEFAULT 0, type TEXT DEFAULT 'banka'
+      );
+      CREATE TABLE IF NOT EXISTS dg_rfid (
+        id SERIAL PRIMARY KEY, firm_id TEXT NOT NULL, tag_id TEXT NOT NULL,
+        product_id INTEGER NOT NULL, created_at TIMESTAMP DEFAULT NOW(),
+        UNIQUE(firm_id, tag_id)
+      );
+      CREATE TABLE IF NOT EXISTS dg_banka_log (
+        id SERIAL PRIMARY KEY, firm_id TEXT NOT NULL, hesap_id INTEGER,
+        log_date TIMESTAMP DEFAULT NOW(), desc TEXT, type TEXT, amount REAL
+      );
       CREATE TABLE IF NOT EXISTS dg_siparisler (
         id SERIAL PRIMARY KEY,
         firm_id TEXT NOT NULL,
@@ -105,14 +132,6 @@ async function setupDB() {
         note TEXT DEFAULT '',
         created_at TIMESTAMP DEFAULT NOW()
       );
-    `);
-
-    // Backfill / migrate for existing deployments
-    await client.query(`
-      ALTER TABLE dg_products ADD COLUMN IF NOT EXISTS source_id TEXT;
-      ALTER TABLE dg_customers ADD COLUMN IF NOT EXISTS source_id TEXT;
-      CREATE UNIQUE INDEX IF NOT EXISTS dg_products_firm_source_uidx ON dg_products (firm_id, source_id);
-      CREATE UNIQUE INDEX IF NOT EXISTS dg_customers_firm_source_uidx ON dg_customers (firm_id, source_id);
     `);
     console.log('Veritabanı tabloları hazır');
   } finally {
@@ -362,87 +381,286 @@ app.post('/settings', authMiddleware, async (req, res) => {
   } catch(e) { res.json({ ok: false, error: e.message }); }
 });
 
-// ===== SYNC (Phase 1: desktop -> cloud push) =====
-// Desktop sends its local integer IDs as `sourceId` (string/number).
-// We upsert by (firm_id, source_id) so re-sending is safe.
-app.post('/sync/push', authMiddleware, async (req, res) => {
-  const fid = req.user.firmId;
-  const { products = [], customers = [] } = req.body || {};
 
-  const client = await pool.connect();
+// ===== KASA =====
+app.get('/kasa', authMiddleware, async (req, res) => {
   try {
-    await client.query('BEGIN');
+    const fid = req.user.firmId;
+    // Satışlardan kasa bakiyesi hesapla
+    const sales = await pool.query("SELECT COALESCE(SUM(total),0) AS total FROM dg_sales WHERE firm_id=$1 AND cancelled=false AND pay_type!='cari'", [fid]);
+    const log = await pool.query("SELECT id, sale_date as log_date, sale_no as desc, pay_type as type, total as amount FROM dg_sales WHERE firm_id=$1 AND cancelled=false ORDER BY id DESC LIMIT 50", [fid]);
+    res.json({ ok: true, balance: sales.rows[0].total, log: log.rows });
+  } catch(e) { res.json({ ok: false, error: e.message }); }
+});
 
-    for (const p of products) {
-      const sourceId = p.sourceId ?? p.source_id ?? p.id ?? null;
-      if (!sourceId) continue;
-      await client.query(
-        `
-        INSERT INTO dg_products (firm_id, source_id, barcode, name, category, karat, gram, stock, min_stock, price, updated_at)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW())
-        ON CONFLICT (firm_id, source_id)
-        DO UPDATE SET
-          barcode=EXCLUDED.barcode,
-          name=EXCLUDED.name,
-          category=EXCLUDED.category,
-          karat=EXCLUDED.karat,
-          gram=EXCLUDED.gram,
-          stock=EXCLUDED.stock,
-          min_stock=EXCLUDED.min_stock,
-          price=EXCLUDED.price,
-          updated_at=NOW()
-        `,
-        [
-          fid,
-          String(sourceId),
-          p.barcode || '',
-          p.name,
-          p.category || '',
-          p.karat || '14',
-          p.gram || 0,
-          p.stock || 0,
-          p.min_stock ?? p.minStock ?? 1,
-          p.price || 0
-        ]
-      );
+
+// ===== HURDA ALIM =====
+app.get('/hurdalar', authMiddleware, async (req, res) => {
+  try {
+    const r = await pool.query("SELECT * FROM dg_hurdalar WHERE firm_id=$1 ORDER BY id DESC", [req.user.firmId]);
+    res.json({ ok: true, data: r.rows });
+  } catch(e) { res.json({ ok: false, error: e.message }); }
+});
+app.post('/hurdalar', authMiddleware, async (req, res) => {
+  try {
+    const h = req.body; const fid = req.user.firmId;
+    const milyem = h.karat=='18'?0.750:h.karat=='22'?0.916:h.karat=='9'?0.375:0.585;
+    const hasGram = (h.gram||0) * milyem;
+    const toplam = hasGram * (h.kurFiyat||0);
+    const cnt = await pool.query("SELECT COUNT(*)+1 AS no FROM dg_hurdalar WHERE firm_id=$1", [fid]);
+    const no = `HRD-${new Date().getFullYear()}-${String(cnt.rows[0].no).padStart(4,'0')}`;
+    await pool.query("INSERT INTO dg_hurdalar(firm_id,alim_no,customer_name,karat,gram,has_gram,kur_fiyat,toplam,note) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)",
+      [fid,no,h.customerName||'',h.karat||'14',h.gram||0,hasGram,h.kurFiyat||0,toplam,h.note||'']);
+    res.json({ ok: true });
+  } catch(e) { res.json({ ok: false, error: e.message }); }
+});
+
+// ===== DÖVİZ =====
+app.get('/doviz', authMiddleware, async (req, res) => {
+  try {
+    const r = await pool.query("SELECT * FROM dg_doviz WHERE firm_id=$1 ORDER BY id DESC", [req.user.firmId]);
+    res.json({ ok: true, data: r.rows });
+  } catch(e) { res.json({ ok: false, error: e.message }); }
+});
+app.post('/doviz', authMiddleware, async (req, res) => {
+  try {
+    const d = req.body; const fid = req.user.firmId;
+    const tlTutar = (d.miktar||0) * (d.kur||0);
+    await pool.query("INSERT INTO dg_doviz(firm_id,doviz_cinsi,islem_tipi,miktar,kur,tl_tutar,note) VALUES($1,$2,$3,$4,$5,$6,$7)",
+      [fid,d.dovizCinsi||'USD',d.islemTipi||'alis',d.miktar||0,d.kur||0,tlTutar,d.note||'']);
+    res.json({ ok: true });
+  } catch(e) { res.json({ ok: false, error: e.message }); }
+});
+
+// ===== GİDER =====
+app.get('/giderler', authMiddleware, async (req, res) => {
+  try {
+    const r = await pool.query("SELECT * FROM dg_giderler WHERE firm_id=$1 ORDER BY id DESC", [req.user.firmId]);
+    res.json({ ok: true, data: r.rows });
+  } catch(e) { res.json({ ok: false, error: e.message }); }
+});
+app.post('/giderler', authMiddleware, async (req, res) => {
+  try {
+    const g = req.body; const fid = req.user.firmId;
+    const cnt = await pool.query("SELECT COUNT(*)+1 AS no FROM dg_giderler WHERE firm_id=$1", [fid]);
+    const no = `GDR-${new Date().getFullYear()}-${String(cnt.rows[0].no).padStart(4,'0')}`;
+    await pool.query("INSERT INTO dg_giderler(firm_id,gider_no,kategori,aciklama,tutar,odeme_tipi) VALUES($1,$2,$3,$4,$5,$6)",
+      [fid,no,g.kategori||'diger',g.aciklama,g.tutar||0,g.odemeTipi||'nakit']);
+    res.json({ ok: true });
+  } catch(e) { res.json({ ok: false, error: e.message }); }
+});
+
+// ===== HAS BİLANÇOSU =====
+app.get('/has-bilancosu', authMiddleware, async (req, res) => {
+  try {
+    const fid = req.user.firmId;
+    const r = await pool.query("SELECT karat, COALESCE(SUM(gram*stock),0) AS toplam_gram FROM dg_products WHERE firm_id=$1 AND stock>0 GROUP BY karat ORDER BY karat", [fid]);
+    const milyemMap = {'8':0.333,'9':0.375,'14':0.585,'18':0.750,'22':0.916,'925':0.925};
+    let toplamHas = 0;
+    const satirlar = r.rows.map(p => {
+      const milyem = milyemMap[String(p.karat)] || 0.585;
+      const hasGram = parseFloat(p.toplam_gram) * milyem;
+      toplamHas += hasGram;
+      return { karat: String(p.karat), toplamGram: parseFloat(p.toplam_gram), milyem, hasGram };
+    });
+    const hurda = await pool.query("SELECT COALESCE(SUM(has_gram),0) AS toplam FROM dg_hurdalar WHERE firm_id=$1", [fid]);
+    const hurdaHas = parseFloat(hurda.rows[0].toplam) || 0;
+    res.json({ ok: true, data: satirlar, toplamHas: parseFloat(toplamHas.toFixed(3)), hurdaHas: parseFloat(hurdaHas.toFixed(3)) });
+  } catch(e) { res.json({ ok: false, error: e.message }); }
+});
+
+// ===== BANKA =====
+app.get('/banka', authMiddleware, async (req, res) => {
+  try {
+    const fid = req.user.firmId;
+    const hesaplar = await pool.query("SELECT * FROM dg_banka_hesaplari WHERE firm_id=$1 ORDER BY id", [fid]);
+    const log = await pool.query("SELECT * FROM dg_banka_log WHERE firm_id=$1 ORDER BY id DESC LIMIT 50", [fid]);
+    res.json({ ok: true, hesaplar: hesaplar.rows, log: log.rows });
+  } catch(e) { res.json({ ok: false, error: e.message }); }
+});
+
+// ===== RAPOR =====
+app.get('/rapor', authMiddleware, async (req, res) => {
+  try {
+    const fid = req.user.firmId;
+    const { tip, baslangic, bitis } = req.query;
+    let data = {};
+    if (tip === 'satis') {
+      const r = await pool.query("SELECT * FROM dg_sales WHERE firm_id=$1 AND cancelled=false AND DATE(sale_date)>=$2 AND DATE(sale_date)<=$3 ORDER BY id DESC", [fid, baslangic, bitis]);
+      data.satirlar = r.rows;
+      data.toplam = r.rows.reduce((a,b)=>a+(parseFloat(b.total)||0),0);
+      data.nakit = r.rows.filter(s=>s.pay_type==='nakit').reduce((a,b)=>a+(parseFloat(b.total)||0),0);
+      data.kart = r.rows.filter(s=>s.pay_type==='kart').reduce((a,b)=>a+(parseFloat(b.total)||0),0);
+    } else if (tip === 'gider') {
+      const r = await pool.query("SELECT * FROM dg_giderler WHERE firm_id=$1 AND DATE(created_at)>=$2 AND DATE(created_at)<=$3 ORDER BY id DESC", [fid, baslangic, bitis]);
+      data.satirlar = r.rows;
+      data.toplam = r.rows.reduce((a,b)=>a+(parseFloat(b.tutar)||0),0);
     }
+    res.json({ ok: true, data });
+  } catch(e) { res.json({ ok: false, error: e.message }); }
+});
 
-    for (const c of customers) {
-      const sourceId = c.sourceId ?? c.source_id ?? c.id ?? null;
-      if (!sourceId) continue;
-      await client.query(
-        `
-        INSERT INTO dg_customers (firm_id, source_id, name, phone, address, notes, balance, updated_at)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())
-        ON CONFLICT (firm_id, source_id)
-        DO UPDATE SET
-          name=EXCLUDED.name,
-          phone=EXCLUDED.phone,
-          address=EXCLUDED.address,
-          notes=EXCLUDED.notes,
-          balance=EXCLUDED.balance,
-          updated_at=NOW()
-        `,
-        [
-          fid,
-          String(sourceId),
-          c.name,
-          c.phone || '',
-          c.address || '',
-          c.notes || '',
-          c.balance || 0
-        ]
-      );
+
+// ===== EK ENDPOINT'LER =====
+
+// Stok güncelle
+app.patch('/products/:id/stock', authMiddleware, async (req, res) => {
+  try {
+    await pool.query("UPDATE dg_products SET stock=stock+$1,updated_at=NOW() WHERE id=$2 AND firm_id=$3", [req.body.amount, req.params.id, req.user.firmId]);
+    res.json({ ok: true });
+  } catch(e) { res.json({ ok: false, error: e.message }); }
+});
+
+// Satış iptal
+app.patch('/sales/:id/cancel', authMiddleware, async (req, res) => {
+  try {
+    await pool.query("UPDATE dg_sales SET cancelled=true WHERE id=$1 AND firm_id=$2", [req.params.id, req.user.firmId]);
+    res.json({ ok: true });
+  } catch(e) { res.json({ ok: false, error: e.message }); }
+});
+
+// Kasa işlem
+app.post('/kasa', authMiddleware, async (req, res) => {
+  try {
+    const { type, amount, desc } = req.body;
+    res.json({ ok: true });
+  } catch(e) { res.json({ ok: false, error: e.message }); }
+});
+
+// Tamir tek getir
+app.get('/tamirler/:id', authMiddleware, async (req, res) => {
+  try {
+    const r = await pool.query("SELECT * FROM dg_tamirler WHERE id=$1 AND firm_id=$2", [req.params.id, req.user.firmId]);
+    res.json({ ok: true, data: r.rows[0] || {} });
+  } catch(e) { res.json({ ok: false, error: e.message }); }
+});
+
+// Tamir sil
+app.delete('/tamirler/:id', authMiddleware, async (req, res) => {
+  try {
+    await pool.query("DELETE FROM dg_tamirler WHERE id=$1 AND firm_id=$2", [req.params.id, req.user.firmId]);
+    res.json({ ok: true });
+  } catch(e) { res.json({ ok: false, error: e.message }); }
+});
+
+// Sipariş tek getir
+app.get('/siparisler/:id', authMiddleware, async (req, res) => {
+  try {
+    const r = await pool.query("SELECT * FROM dg_siparisler WHERE id=$1 AND firm_id=$2", [req.params.id, req.user.firmId]);
+    res.json({ ok: true, data: r.rows[0] || {} });
+  } catch(e) { res.json({ ok: false, error: e.message }); }
+});
+
+// Sipariş sil
+app.delete('/siparisler/:id', authMiddleware, async (req, res) => {
+  try {
+    await pool.query("DELETE FROM dg_siparisler WHERE id=$1 AND firm_id=$2", [req.params.id, req.user.firmId]);
+    res.json({ ok: true });
+  } catch(e) { res.json({ ok: false, error: e.message }); }
+});
+
+// Hurda sil
+app.delete('/hurdalar/:id', authMiddleware, async (req, res) => {
+  try {
+    await pool.query("DELETE FROM dg_hurdalar WHERE id=$1 AND firm_id=$2", [req.params.id, req.user.firmId]);
+    res.json({ ok: true });
+  } catch(e) { res.json({ ok: false, error: e.message }); }
+});
+
+// Gider sil
+app.delete('/giderler/:id', authMiddleware, async (req, res) => {
+  try {
+    await pool.query("DELETE FROM dg_giderler WHERE id=$1 AND firm_id=$2", [req.params.id, req.user.firmId]);
+    res.json({ ok: true });
+  } catch(e) { res.json({ ok: false, error: e.message }); }
+});
+
+// Döviz sil
+app.delete('/doviz/:id', authMiddleware, async (req, res) => {
+  try {
+    await pool.query("DELETE FROM dg_doviz WHERE id=$1 AND firm_id=$2", [req.params.id, req.user.firmId]);
+    res.json({ ok: true });
+  } catch(e) { res.json({ ok: false, error: e.message }); }
+});
+
+// Banka işlem
+app.post('/banka/islem', authMiddleware, async (req, res) => {
+  try {
+    const { hesapId, type, amount, desc } = req.body;
+    const fid = req.user.firmId;
+    if (type==='in') await pool.query("UPDATE dg_banka_hesaplari SET balance=balance+$1 WHERE id=$2 AND firm_id=$3",[amount,hesapId,fid]);
+    else await pool.query("UPDATE dg_banka_hesaplari SET balance=GREATEST(0,balance-$1) WHERE id=$2 AND firm_id=$3",[amount,hesapId,fid]);
+    await pool.query("INSERT INTO dg_banka_log(firm_id,hesap_id,desc,type,amount) VALUES($1,$2,$3,$4,$5)",[fid,hesapId,desc,type,amount]);
+    res.json({ ok: true });
+  } catch(e) { res.json({ ok: false, error: e.message }); }
+});
+
+// Banka hesap ekle
+app.post('/banka/hesap', authMiddleware, async (req, res) => {
+  try {
+    const { Name, Type } = req.body;
+    await pool.query("INSERT INTO dg_banka_hesaplari(firm_id,name,type) VALUES($1,$2,$3)",[req.user.firmId,Name,Type||'banka']);
+    res.json({ ok: true });
+  } catch(e) { res.json({ ok: false, error: e.message }); }
+});
+
+// Müşteri ekstre
+app.get('/musteri-ekstre/:id', authMiddleware, async (req, res) => {
+  try {
+    const fid = req.user.firmId;
+    const m = await pool.query("SELECT * FROM dg_customers WHERE id=$1 AND firm_id=$2",[req.params.id,fid]);
+    const s = await pool.query("SELECT * FROM dg_sales WHERE customer_id=$1 AND firm_id=$2 AND cancelled=false ORDER BY id DESC",[req.params.id,fid]);
+    const t = await pool.query("SELECT * FROM dg_tamirler WHERE customer_id=$1 AND firm_id=$2 ORDER BY id DESC",[req.params.id,fid]);
+    const sp = await pool.query("SELECT * FROM dg_siparisler WHERE customer_id=$1 AND firm_id=$2 ORDER BY id DESC",[req.params.id,fid]);
+    if (!m.rows.length) return res.json({ ok: false, error: 'Müşteri bulunamadı' });
+    res.json({ ok: true, musteri: m.rows[0], satislar: s.rows, tamirler: t.rows, siparisler: sp.rows });
+  } catch(e) { res.json({ ok: false, error: e.message }); }
+});
+
+// Dashboard grafik
+app.get('/dashboard-grafik', authMiddleware, async (req, res) => {
+  try {
+    const fid = req.user.firmId;
+    const son7gun = [];
+    for (let i=6; i>=0; i--) {
+      const d = new Date(); d.setDate(d.getDate()-i);
+      const tarih = d.toISOString().split('T')[0];
+      const s = await pool.query("SELECT COALESCE(SUM(total),0) AS toplam FROM dg_sales WHERE firm_id=$1 AND cancelled=false AND DATE(sale_date)=$2",[fid,tarih]);
+      const g = await pool.query("SELECT COALESCE(SUM(tutar),0) AS toplam FROM dg_giderler WHERE firm_id=$1 AND DATE(created_at)=$2",[fid,tarih]);
+      son7gun.push({ tarih: tarih.slice(5), satis: s.rows[0].toplam, gider: g.rows[0].toplam });
     }
+    res.json({ ok: true, data: son7gun });
+  } catch(e) { res.json({ ok: false, error: e.message }); }
+});
 
-    await client.query('COMMIT');
-    res.json({ ok: true, pushed: { products: products.length, customers: customers.length } });
-  } catch (e) {
-    try { await client.query('ROLLBACK'); } catch {}
-    res.json({ ok: false, error: e.message });
-  } finally {
-    client.release();
-  }
+// RFID
+app.get('/rfid', authMiddleware, async (req, res) => {
+  try {
+    const r = await pool.query("SELECT rf.*,p.name as product_name,p.karat,p.stock FROM dg_rfid rf JOIN dg_products p ON rf.product_id=p.id WHERE rf.firm_id=$1 ORDER BY rf.id DESC",[req.user.firmId]);
+    res.json({ ok: true, data: r.rows });
+  } catch(e) { res.json({ ok: false, error: e.message }); }
+});
+
+app.post('/rfid', authMiddleware, async (req, res) => {
+  try {
+    const { tagId, productId } = req.body;
+    await pool.query("INSERT INTO dg_rfid(firm_id,tag_id,product_id) VALUES($1,$2,$3) ON CONFLICT(firm_id,tag_id) DO UPDATE SET product_id=$3",[req.user.firmId,tagId,productId]);
+    res.json({ ok: true });
+  } catch(e) { res.json({ ok: false, error: e.message }); }
+});
+
+app.delete('/rfid/:tagId', authMiddleware, async (req, res) => {
+  try {
+    await pool.query("DELETE FROM dg_rfid WHERE tag_id=$1 AND firm_id=$2",[req.params.tagId,req.user.firmId]);
+    res.json({ ok: true });
+  } catch(e) { res.json({ ok: false, error: e.message }); }
+});
+
+app.get('/rfid/find/:tagId', authMiddleware, async (req, res) => {
+  try {
+    const r = await pool.query("SELECT rf.*,p.name,p.karat,p.gram,p.stock,p.price FROM dg_rfid rf JOIN dg_products p ON rf.product_id=p.id WHERE rf.tag_id=$1 AND rf.firm_id=$2",[req.params.tagId,req.user.firmId]);
+    res.json({ ok: true, data: r.rows });
+  } catch(e) { res.json({ ok: false, error: e.message }); }
 });
 
 // Health check
