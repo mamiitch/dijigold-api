@@ -24,7 +24,7 @@ async function setupDB() {
         firm_id TEXT NOT NULL,
         username TEXT NOT NULL,
         password TEXT NOT NULL,
-        name TEXT,
+        user_name TEXT,
         role TEXT DEFAULT 'admin',
         created_at TIMESTAMP DEFAULT NOW(),
         UNIQUE(firm_id, username)
@@ -104,8 +104,8 @@ async function setupDB() {
         odeme_tipi TEXT DEFAULT 'nakit', created_at TIMESTAMP DEFAULT NOW()
       );
       CREATE TABLE IF NOT EXISTS dg_banka_hesaplari (
-        id SERIAL PRIMARY KEY, firm_id TEXT NOT NULL, name TEXT NOT NULL,
-        balance REAL DEFAULT 0, type TEXT DEFAULT 'banka'
+        id SERIAL PRIMARY KEY, firm_id TEXT NOT NULL, hesap_name TEXT NOT NULL,
+        balance REAL DEFAULT 0, hesap_type TEXT DEFAULT 'banka'
       );
       CREATE TABLE IF NOT EXISTS dg_rfid (
         id SERIAL PRIMARY KEY, firm_id TEXT NOT NULL, tag_id TEXT NOT NULL,
@@ -114,7 +114,7 @@ async function setupDB() {
       );
       CREATE TABLE IF NOT EXISTS dg_banka_log (
         id SERIAL PRIMARY KEY, firm_id TEXT NOT NULL, hesap_id INTEGER,
-        log_date TIMESTAMP DEFAULT NOW(), desc TEXT, type TEXT, amount REAL
+        log_date TIMESTAMP DEFAULT NOW(), description TEXT, log_type TEXT, amount REAL
       );
       CREATE TABLE IF NOT EXISTS dg_siparisler (
         id SERIAL PRIMARY KEY,
@@ -159,7 +159,7 @@ app.post('/auth/register', async (req, res) => {
     if (!firmId || !username || !password) return res.json({ ok: false, error: 'Eksik bilgi' });
     const hash = await bcrypt.hash(password, 10);
     await pool.query(
-      'INSERT INTO dg_users (firm_id, username, password, name, role) VALUES ($1,$2,$3,$4,$5)',
+      'INSERT INTO dg_users (firm_id, username, password, user_name, role) VALUES ($1,$2,$3,$4,$5)',
       [firmId, username, hash, name || 'Admin', 'admin']
     );
     res.json({ ok: true });
@@ -181,7 +181,7 @@ app.post('/auth/login', async (req, res) => {
     const match = await bcrypt.compare(password, user.password);
     if (!match) return res.json({ ok: false, error: 'Şifre hatalı' });
     const token = jwt.sign({ userId: user.id, firmId: user.firm_id, role: user.role }, JWT_SECRET, { expiresIn: '30d' });
-    res.json({ ok: true, token, user: { name: user.name, role: user.role, username: user.username } });
+    res.json({ ok: true, token, user: { name: user.user_name, role: user.role, username: user.username } });
   } catch(e) { res.json({ ok: false, error: e.message }); }
 });
 
@@ -388,7 +388,7 @@ app.get('/kasa', authMiddleware, async (req, res) => {
     const fid = req.user.firmId;
     // Satışlardan kasa bakiyesi hesapla
     const sales = await pool.query("SELECT COALESCE(SUM(total),0) AS total FROM dg_sales WHERE firm_id=$1 AND cancelled=false AND pay_type!='cari'", [fid]);
-    const log = await pool.query("SELECT id, sale_date as log_date, sale_no as desc, pay_type as type, total as amount FROM dg_sales WHERE firm_id=$1 AND cancelled=false ORDER BY id DESC LIMIT 50", [fid]);
+    const log = await pool.query("SELECT id, sale_date as log_date, sale_no as aciklama, pay_type as log_type, total as amount FROM dg_sales WHERE firm_id=$1 AND cancelled=false ORDER BY id DESC LIMIT 50", [fid]);
     res.json({ ok: true, balance: sales.rows[0].total, log: log.rows });
   } catch(e) { res.json({ ok: false, error: e.message }); }
 });
@@ -590,7 +590,7 @@ app.post('/banka/islem', authMiddleware, async (req, res) => {
     const fid = req.user.firmId;
     if (type==='in') await pool.query("UPDATE dg_banka_hesaplari SET balance=balance+$1 WHERE id=$2 AND firm_id=$3",[amount,hesapId,fid]);
     else await pool.query("UPDATE dg_banka_hesaplari SET balance=GREATEST(0,balance-$1) WHERE id=$2 AND firm_id=$3",[amount,hesapId,fid]);
-    await pool.query("INSERT INTO dg_banka_log(firm_id,hesap_id,desc,type,amount) VALUES($1,$2,$3,$4,$5)",[fid,hesapId,desc,type,amount]);
+    await pool.query("INSERT INTO dg_banka_log(firm_id,hesap_id,description,log_type,amount) VALUES($1,$2,$3,$4,$5)",[fid,hesapId,desc,type,amount]);
     res.json({ ok: true });
   } catch(e) { res.json({ ok: false, error: e.message }); }
 });
@@ -599,7 +599,7 @@ app.post('/banka/islem', authMiddleware, async (req, res) => {
 app.post('/banka/hesap', authMiddleware, async (req, res) => {
   try {
     const { Name, Type } = req.body;
-    await pool.query("INSERT INTO dg_banka_hesaplari(firm_id,name,type) VALUES($1,$2,$3)",[req.user.firmId,Name,Type||'banka']);
+    await pool.query("INSERT INTO dg_banka_hesaplari(firm_id,hesap_name,hesap_type) VALUES($1,$2,$3)",[req.user.firmId,Name,Type||'banka']);
     res.json({ ok: true });
   } catch(e) { res.json({ ok: false, error: e.message }); }
 });
